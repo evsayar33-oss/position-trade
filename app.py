@@ -6,23 +6,23 @@ from datetime import datetime
 import requests
 
 # --- 0. KONFİGÜRASYON ---
-st.set_page_config(page_title="Quant Macro Engine V2.1", layout="wide")
+st.set_page_config(page_title="Quant Macro Engine V2.2", layout="wide")
 st.markdown("""
     <style>
     .main { background-color: #0d1117; color: white; }
     .report-card { background: #161b22; padding: 15px; border-radius: 12px; border: 1px solid #30363d; margin-bottom: 10px; }
     .sector-card { background: #0d1117; padding: 8px; border-radius: 8px; border-left: 3px solid #58a6ff; margin: 4px 0; }
     .metric-val { color: #58a6ff; font-weight: bold; }
+    .check-date { font-size: 11px; color: #8b949e; }
     </style>
     """, unsafe_allow_html=True)
 
 # SECRETS (FRED API KEY)
 fred_api_key = st.secrets.get("FRED_API_KEY", None)
 
-# --- 1. VERİ MOTORU (YAHOO + FRED) ---
+# --- 1. ÖZELLEŞTİRİLMİŞ TAKVİM MOTORU ---
 @st.cache_data(ttl=3600)
-def get_hybrid_data(api_key):
-    # Yahoo Verileri (ETF & Kripto)
+def get_scheduled_data(api_key):
     tickers = {
         'SPY': 'SPY', 'QQQ': 'QQQ', 'SOXX': 'SOXX', 'CIBR': 'CIBR', 'ITA': 'ITA', 
         'XLV': 'XLV', 'XLF': 'XLF', 'XLY': 'XLY', 'XLE': 'XLE', 'BTC': 'BTC-USD',
@@ -32,14 +32,10 @@ def get_hybrid_data(api_key):
     df_y = yf.download(list(tickers.values()), period="5y", interval="1d")['Close'].ffill()
     df_y = df_y.rename(columns={v: k for k, v in tickers.items()})
     
-    # FRED Verileri (10Y-3M Spread, Breakeven Inflation, Fed Balance Sheet)
+    # FRED Verileri
     df_f = pd.DataFrame(index=df_y.index)
     if api_key:
-        fred_ids = {
-            'T10Y3M': 'T10Y3M',       # Yield Spread (10Y - 3M)
-            'T10YIE': 'T10YIE',       # Breakeven Inflation
-            'WALCL': 'WALCL'          # Fed Balance Sheet
-        }
+        fred_ids = {'T10Y3M': 'T10Y3M', 'T10YIE': 'T10YIE', 'WALCL': 'WALCL'}
         for name, s_id in fred_ids.items():
             try:
                 url = f"https://api.stlouisfed.org/fred/series/observations?series_id={s_id}&api_key={api_key}&file_type=json"
@@ -49,42 +45,43 @@ def get_hybrid_data(api_key):
                 obs['date'] = pd.to_datetime(obs['date'])
                 obs = obs.set_index('date')
                 df_f[name] = obs['value'].reindex(df_y.index, method='ffill')
-            except:
-                pass
+            except: pass
+
+    # --- ZAMANLAMA FİLTRELERİ ---
     
-    df_w = df_y.resample('W-FRI').last().ffill()
-    df_m = df_y.resample('MS').last().ffill()
-    df_f_m = df_f.resample('MS').last().ffill()
+    # HAFTALIK (Salı: 1, Cuma: 4)
+    df_w = df_y[df_y.index.dayofweek.isin([1, 4])].ffill()
+    
+    # AYLIK (1. ve 15. Günler veya en yakın işlem günü)
+    df_m = df_y[df_y.index.day.isin([1, 15, 2, 16, 3, 17])].resample('SM').last().ffill()
+    df_f_m = df_f[df_f.index.day.isin([1, 15, 2, 16, 3, 17])].resample('SM').last().ffill()
     
     return df_y, df_w, df_m, df_f_m
 
-# --- 2. HESAPLAMA MOTORU (LEVEL 1-6) ---
+# --- 2. HESAPLAMA MOTORU ---
 def run_quant_engine(df_y, df_w, df_m, df_f_m):
-    # LEVEL 1: MAKRO KADRAN (Market-Implied)
+    # LEVEL 1: MAKRO KADRAN (1. ve 15. Gün Verileriyle)
     g_ratio = df_m['XLI'] / df_m['XLP']
     i_ratio = df_m['TIP'] / df_m['IEF']
     
-    g_now = g_ratio.rolling(3).mean().iloc[-1] > g_ratio.rolling(12).mean().iloc[-1]
-    i_now = i_ratio.rolling(3).mean().iloc[-1] > i_ratio.rolling(12).mean().iloc[-1]
+    # 3 ve 12 Dönemlik Ortalamalar (Her dönem artık ~15 gün)
+    g_now = g_ratio.rolling(6).mean().iloc[-1] > g_ratio.rolling(24).mean().iloc[-1]
+    i_now = i_ratio.rolling(6).mean().iloc[-1] > i_ratio.rolling(24).mean().iloc[-1]
     
     quad_map = {(True, False): "GOLDILOCKS", (True, True): "AŞIRI ISINMA", 
                 (False, True): "STAGFLASYON", (False, False): "DARALMA"}
     current_quad = quad_map.get((g_now, i_now))
 
-    # LEVEL 2: CIRCUIT BREAKER (FRED T10Y3M)
-    spread = df_f_m['T10Y3M'] if 'T10Y3M' in df_f_m.columns else (df_m['SPY'] * 0) # Fallback
-    was_inverted = (spread.shift(1).rolling(6).min() < 0).iloc[-1]
+    # LEVEL 2: CIRCUIT BREAKER (T10Y3M)
+    spread = df_f_m['T10Y3M'] if 'T10Y3M' in df_f_m.columns else (df_m['SPY'] * 0)
+    was_inverted = (spread.shift(1).rolling(12).min() < 0).iloc[-1] # Son 12 yarı-ay (6 ay)
     cb_active = was_inverted and (spread.iloc[-1] > 0)
     
-    # Reset Logic
-    if (spread.rolling(3).min().iloc[-1] > 0.50) or (g_now and spread.rolling(2).min().iloc[-1] > 0):
-        cb_active = False
-
-    # Hysteresis
-    confidence = 100 if current_quad == quad_map.get((g_ratio.rolling(3).mean().iloc[-2] > g_ratio.rolling(12).mean().iloc[-2], 
-                                                     i_ratio.rolling(3).mean().iloc[-2] > i_ratio.rolling(12).mean().iloc[-2])) else 50
-    final_quad = current_quad if confidence == 100 else quad_map.get((g_ratio.rolling(3).mean().iloc[-2] > g_ratio.rolling(12).mean().iloc[-2], 
-                                                                    i_ratio.rolling(3).mean().iloc[-2] > i_ratio.rolling(12).mean().iloc[-2]))
+    # Hysteresis (15 Günlük Teyit)
+    confidence = 100 if current_quad == quad_map.get((g_ratio.rolling(6).mean().iloc[-2] > g_ratio.rolling(24).mean().iloc[-2], 
+                                                     i_ratio.rolling(6).mean().iloc[-2] > i_ratio.rolling(24).mean().iloc[-2])) else 50
+    final_quad = current_quad if confidence == 100 else quad_map.get((g_ratio.rolling(6).mean().iloc[-2] > g_ratio.rolling(24).mean().iloc[-2], 
+                                                                    i_ratio.rolling(6).mean().iloc[-2] > i_ratio.rolling(24).mean().iloc[-2]))
 
     # Taban Tahsisat
     base_alloc = {
@@ -95,7 +92,7 @@ def run_quant_engine(df_y, df_w, df_m, df_f_m):
     }
     w = base_alloc[final_quad].copy()
 
-    # LEVEL 1.1: ROTASYON MANTIĞI
+    # LEVEL 1.1: ROTASYON (Salı-Cuma Verileriyle)
     sector_universe = {
         "GOLDILOCKS": ["SOXX", "CIBR", "XLY", "QQQ", "BTC"],
         "AŞIRI ISINMA": ["XLF", "XLI", "XLE", "SPY"],
@@ -116,21 +113,21 @@ def run_quant_engine(df_y, df_w, df_m, df_f_m):
     if confidence == 50:
         w["ENDEKS"] *= 0.8; w["EMTIA"] *= 0.8
 
-    # --- NİHAİ HESAPLAMALAR ---
+    # --- HESAPLAMALAR ---
     final_res = {"SECTORS": {}, "COMMOS": {}, "TLT": 0, "BIL": 0}
     
-    # 1. Endeks & Sektörler
+    # 1. Endeks & Sektörler (Salı-Cuma İvmesi)
     idx_budget = w["ENDEKS"]
     active_sectors = sector_universe[final_quad]
     for s in active_sectors:
         price = df_w[s]
-        ema20 = price.ewm(span=20).mean().iloc[-1]
-        ema50 = price.ewm(span=50).mean().iloc[-1]
-        delta = price.diff(); g = delta.where(delta>0,0).rolling(14).mean(); l = (-delta.where(delta<0,0)).rolling(14).mean()
+        ema20 = price.ewm(span=40).mean().iloc[-1] # Periyot ayarı (Haftada 2 gün olduğu için 40)
+        ema50 = price.ewm(span=100).mean().iloc[-1]
+        delta = price.diff(); g = delta.where(delta>0,0).rolling(28).mean(); l = (-delta.where(delta<0,0)).rolling(28).mean()
         rsi = 100 - (100/(1+(g.iloc[-1]/l.iloc[-1]))) if l.iloc[-1] != 0 else 100
         is_bull = (price.iloc[-1] > ema50) and (ema20 > ema50) and (rsi > 50)
         
-        vol = price.pct_change().rolling(20).std().iloc[-1] * np.sqrt(52)
+        vol = price.pct_change().rolling(40).std().iloc[-1] * np.sqrt(104) # 104 (52 hafta * 2 gün)
         v_cap = 0.12 / vol if vol > 0 else 1.0
         s_w = (idx_budget / len(active_sectors))
         if not is_bull: s_w = min(s_w, 0.05)
@@ -138,31 +135,35 @@ def run_quant_engine(df_y, df_w, df_m, df_f_m):
         
         final_res["SECTORS"][s] = {"w": min(s_w, v_cap), "rsi": rsi, "trend": "BOĞA" if is_bull else "AYI"}
 
-    # 2. Emtia
+    # 2. Emtia & Tahvil
     c_budget = w["EMTIA"]
     for c, sh in commo_universe[final_quad].items():
-        v_c = df_w[c].pct_change().rolling(20).std().iloc[-1] * np.sqrt(52)
-        v_cap_c = 0.12 / v_c if v_c > 0 else 1.0
-        final_res["COMMOS"][c] = min(sh * c_budget, v_cap_c)
+        v_c = df_w[c].pct_change().rolling(40).std().iloc[-1] * np.sqrt(104)
+        final_res["COMMOS"][c] = min(sh * c_budget, 0.12 / v_c if v_c > 0 else 1.0)
 
-    # 3. Tahvil
-    t_v = df_w['TLT'].pct_change().rolling(20).std().iloc[-1] * np.sqrt(52)
+    t_v = df_w['TLT'].pct_change().rolling(40).std().iloc[-1] * np.sqrt(104)
     final_res["TLT"] = min(w["TAHVIL"], 0.12 / t_v if t_v > 0 else 1.0)
     
     total_r = sum([v['w'] for v in final_res["SECTORS"].values()]) + sum(final_res["COMMOS"].values()) + final_res["TLT"]
     final_res["BIL"] = 1.0 - total_r
     
-    return final_res, current_quad, confidence, cb_active, spread.iloc[-1]
+    return final_res, current_quad, confidence, cb_active, spread.iloc[-1], df_w.index[-1], df_m.index[-1]
 
 # --- 3. UI DASHBOARD ---
 try:
-    df_y, df_w, df_m, df_f_m = get_hybrid_data(fred_api_key)
-    res, quad, conf, cb, spread_v = run_quant_engine(df_y, df_w, df_m, df_f_m)
+    df_y, df_w, df_m, df_f_m = get_scheduled_data(fred_api_key)
+    res, quad, conf, cb, spread_v, last_w_date, last_m_date = run_quant_engine(df_y, df_w, df_m, df_f_m)
 
-    st.markdown("### 🛡️ QUANT MACRO POSITION TRADER V2.1")
-    if not fred_api_key: st.warning("⚠️ FRED API Key bulunamadı. Makro omurga yedek verilerle çalışıyor.")
+    st.markdown("### 🛡️ QUANT MACRO POSITION TRADER V2.2")
+    
+    # Takvim Durum Çubuğu
+    st.markdown(f"""
+        <div class="report-card">
+            <span class="check-date">📅 <b>Haftalık Kontrol (Salı-Cuma):</b> {last_w_date.strftime('%d.%m.%Y')}</span> | 
+            <span class="check-date">🗓️ <b>Aylık Kontrol (1-15):</b> {last_m_date.strftime('%d.%m.%Y')}</span>
+        </div>
+    """, unsafe_allow_html=True)
 
-    # Üst Bilgiler
     c1, c2, c3 = st.columns(3)
     c1.metric("Aktif Kadran", quad, f"Güven: %{conf}")
     c2.metric("Resesyon Şalteri", "AKTİF 🚨" if cb else "PASİF ✅")
@@ -170,32 +171,18 @@ try:
 
     st.divider()
 
-    # Sektörler
+    # Sektörler & Portföy (Görsel kısımlar aynı bırakıldı)
     t_idx = sum([v['w'] for v in res['SECTORS'].values()])
     with st.expander(f"📌 ENDEKS & SEKTÖRLER (%{t_idx*100:.1f})", expanded=True):
         for s, v in res['SECTORS'].items():
-            st.markdown(f'''
-            <div class="sector-card">
-                <div style="display:flex; justify-content:space-between;">
-                    <b>{s}</b> <span class="metric-val">%{v['w']*100:.1f}</span>
-                </div>
-                <div style="font-size:11px; color:#aaa;">Trend: {v['trend']} | RSI: {v['rsi']:.1f}</div>
-            </div>
-            ''', unsafe_allow_html=True)
+            st.markdown(f'<div class="sector-card"><div style="display:flex; justify-content:space-between;"><b>{s}</b> <span class="metric-val">%{v['w']*100:.1f}</span></div><div style="font-size:11px; color:#aaa;">Trend: {v['trend']} | RSI: {v['rsi']:.1f}</div></div>', unsafe_allow_html=True)
 
-    # Emtia
     t_c = sum(res['COMMOS'].values())
     with st.expander(f"📦 EMTİA GRUBU (%{t_c*100:.1f})", expanded=True):
         for c, weight in res['COMMOS'].items():
             st.markdown(f"**{c}:** <span class='metric-val'>%{weight*100:.1f}</span>", unsafe_allow_html=True)
 
-    # Özet
-    st.markdown(f'''
-    <div class="report-card">
-        <b>🏛️ TAHVİL (TLT):</b> <span class="metric-val">%{res['TLT']*100:.1f}</span><br>
-        <b>💵 NAKİT (BIL):</b> <span class="metric-val">%{res['BIL']*100:.1f}</span>
-    </div>
-    ''', unsafe_allow_html=True)
+    st.markdown(f'<div class="report-card"><b>🏛️ TAHVİL (TLT):</b> <span class="metric-val">%{res['TLT']*100:.1f}</span><br><b>💵 NAKİT (BIL):</b> <span class="metric-val">%{res['BIL']*100:.1f}</span></div>', unsafe_allow_html=True)
 
     st.info("🔄 Rebalans: Portföy sapması <%5 threshold içerisinde.")
 
