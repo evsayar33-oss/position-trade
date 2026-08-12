@@ -4,139 +4,196 @@ import numpy as np
 import yfinance as yf
 from datetime import datetime
 
-# --- 0. SİSTEM AYARLARI ---
+# --- 0. AYARLAR VE TASARIM ---
 st.set_page_config(page_title="Quant Macro Position Trader", layout="wide")
-st.markdown("<style>.main { background-color: #0d1117; color: white; }</style>", unsafe_allow_html=True)
+st.markdown("""
+    <style>
+    .main { background-color: #0d1117; color: white; }
+    .report-card { background: #161b22; padding: 15px; border-radius: 12px; border: 1px solid #30363d; margin-bottom: 10px; }
+    .sector-card { background: #0d1117; padding: 8px; border-radius: 8px; border-left: 3px solid #58a6ff; margin: 4px 0; }
+    .metric-val { color: #58a6ff; font-weight: bold; }
+    .status-box { padding: 5px 10px; border-radius: 5px; font-weight: bold; font-size: 12px; }
+    </style>
+    """, unsafe_allow_html=True)
 
-# --- 1. VERİ MOTORU (API KEY GEREKTİRMEZ) ---
+# --- 1. VERİ HAVUZU ---
 @st.cache_data(ttl=3600)
-def get_engine_data():
-    # Gerekli semboller: ES=F (SPY), TLT, DBC, BIL, XLI, XLP, TIP, IEF, ^TNX (10Y), ^IRX (13W)
+def get_dynamic_data():
+    # Tüm enstrüman havuzu
     tickers = {
-        'SPY': 'SPY', 'TLT': 'TLT', 'DBC': 'DBC', 'BIL': 'BIL',
-        'XLI': 'XLI', 'XLP': 'XLP', 'TIP': 'TIP', 'IEF': 'IEF',
-        'TNX': '^TNX', 'IRX': '^IRX'
+        'XLI': 'XLI', 'XLP': 'XLP', 'TIP': 'TIP', 'IEF': 'IEF', 'TNX': '^TNX', 'IRX': '^IRX',
+        'SPY': 'SPY', 'QQQ': 'QQQ', 'SOXX': 'SOXX', 'CIBR': 'CIBR', 'ITA': 'ITA', 
+        'XLV': 'XLV', 'XLF': 'XLF', 'XLY': 'XLY', 'XLE': 'XLE', 'BTC': 'BTC-USD',
+        'TLT': 'TLT', 'GLD': 'GLD', 'SLV': 'SLV', 'USO': 'USO', 'DBB': 'DBB', 'DBA': 'DBA', 'BIL': 'BIL'
     }
-    # Veriyi çek (5 yıllık günlük veri)
     raw = yf.download(list(tickers.values()), period="5y", interval="1d")['Close'].ffill()
     df = raw.rename(columns={v: k for k, v in tickers.items()})
     
-    # IRX endeks değerini yüzdeye çevir (Hazine bonosu faizi)
-    df['IRX'] = df['IRX']
-    
-    # Haftalık (Cuma) ve Aylık (Ay Başı) resample
+    # Haftalık ve Aylık Resample
     df_w = df.resample('W-FRI').last().ffill()
     df_m = df.resample('MS').last().ffill()
-    
     return df, df_w, df_m
 
-# --- 2. QUANT MOTORU ---
+# --- 2. QUANT MOTORU (LEVEL 1-6) ---
 def run_quant_engine(df_d, df_w, df_m):
-    # --- LEVEL 1: MAKRO KADRAN ---
-    growth_ratio = df_m['XLI'] / df_m['XLP']
-    infl_ratio = df_m['TIP'] / df_m['IEF']
+    # LEVEL 1: MAKRO KADRAN
+    g_ratio = df_m['XLI'] / df_m['XLP']
+    i_ratio = df_m['TIP'] / df_m['IEF']
     
-    # 3 Ay vs 12 Ay Ortalamalar
-    g_signal = growth_ratio.rolling(3).mean().iloc[-1] > growth_ratio.rolling(12).mean().iloc[-1]
-    i_signal = infl_ratio.rolling(3).mean().iloc[-1] > infl_ratio.rolling(12).mean().iloc[-1]
+    g_now = g_ratio.rolling(3).mean().iloc[-1] > g_ratio.rolling(12).mean().iloc[-1]
+    i_now = i_ratio.rolling(3).mean().iloc[-1] > i_ratio.rolling(12).mean().iloc[-1]
     
-    def get_quad_name(g, i):
-        if g and not i: return "GOLDILOCKS"
-        if g and i: return "AŞIRI ISINMA"
-        if not g and i: return "STAGFLASYON"
-        return "DARALMA"
+    quad_map = {(True, False): "GOLDILOCKS", (True, True): "AŞIRI ISINMA", 
+                (False, True): "STAGFLASYON", (False, False): "DARALMA"}
+    current_quad = quad_map.get((g_now, i_now))
 
-    current_quad = get_quad_name(g_signal, i_signal)
-    prev_g = growth_ratio.rolling(3).mean().iloc[-2] > growth_ratio.rolling(12).mean().iloc[-2]
-    prev_i = infl_ratio.rolling(3).mean().iloc[-2] > infl_ratio.rolling(12).mean().iloc[-2]
-    prev_quad = get_quad_name(prev_g, prev_i)
-
-    # --- LEVEL 2: CIRCUIT BREAKER & HYSTERESIS ---
+    # LEVEL 2: CIRCUIT BREAKER & HYSTERESIS
     spread = df_m['TNX'] - df_m['IRX']
-    # TİGGER: Son 6 ayda negatif (<0) olup tekrar >0 oldu mu?
     was_inverted = (spread.shift(1).rolling(6).min() < 0).iloc[-1]
-    circuit_breaker = was_inverted and (spread.iloc[-1] > 0)
+    cb_active = was_inverted and (spread.iloc[-1] > 0)
     
-    # Reset Koşulları
-    cb_reset_a = (spread.rolling(3).min().iloc[-1] > 0.50)
-    cb_reset_b = g_signal and (spread.rolling(2).min().iloc[-1] > 0)
-    if cb_reset_a or cb_reset_b: circuit_breaker = False
+    # Reset Logic
+    if (spread.rolling(3).min().iloc[-1] > 0.50) or (g_now and spread.rolling(2).min().iloc[-1] > 0):
+        cb_active = False
 
     # Hysteresis
+    g_prev = g_ratio.rolling(3).mean().iloc[-2] > g_ratio.rolling(12).mean().iloc[-2]
+    i_prev = i_ratio.rolling(3).mean().iloc[-2] > i_ratio.rolling(12).mean().iloc[-2]
+    prev_quad = quad_map.get((g_prev, i_prev))
     confidence = 100 if current_quad == prev_quad else 50
+    final_quad = current_quad if confidence == 100 else prev_quad
 
-    # Taban Ağırlıklar
-    base_weights = {
-        "GOLDILOCKS": {"SPY": 0.60, "TLT": 0.20, "DBC": 0.10, "BIL": 0.10},
-        "AŞIRI ISINMA": {"SPY": 0.30, "TLT": 0.00, "DBC": 0.50, "BIL": 0.20},
-        "STAGFLASYON": {"SPY": 0.10, "TLT": 0.00, "DBC": 0.50, "BIL": 0.40},
-        "DARALMA": {"SPY": 0.10, "TLT": 0.50, "DBC": 0.10, "BIL": 0.30}
+    # Ana Taban Ağırlıklar
+    base_alloc = {
+        "GOLDILOCKS": {"ENDEKS": 0.60, "TAHVIL": 0.20, "EMTIA": 0.10, "NAKIT": 0.10},
+        "AŞIRI ISINMA": {"ENDEKS": 0.30, "TAHVIL": 0.00, "EMTIA": 0.50, "NAKIT": 0.20},
+        "STAGFLASYON": {"ENDEKS": 0.10, "TAHVIL": 0.00, "EMTIA": 0.50, "NAKIT": 0.40},
+        "DARALMA": {"ENDEKS": 0.10, "TAHVIL": 0.50, "EMTIA": 0.10, "NAKIT": 0.30}
+    }
+    w = base_alloc[final_quad].copy()
+
+    # LEVEL 1.1: SEKTÖR VE EMTİA ROTASYONU
+    sector_universe = {
+        "GOLDILOCKS": ["SOXX", "CIBR", "XLY", "QQQ", "BTC"],
+        "AŞIRI ISINMA": ["XLF", "XLI", "XLE", "SPY"],
+        "STAGFLASYON": ["XLV", "ITA", "SPY"],
+        "DARALMA": ["XLV", "ITA", "SPY"]
     }
     
-    w = base_weights[current_quad if confidence == 100 else prev_quad].copy()
+    commo_universe = {
+        "GOLDILOCKS": {"GLD": 0.5, "SLV": 0.2, "DBB": 0.15, "DBA": 0.15},
+        "DARALMA": {"GLD": 0.5, "SLV": 0.2, "DBB": 0.15, "DBA": 0.15},
+        "AŞIRI ISINMA": {"USO": 0.4, "GLD": 0.3, "SLV": 0.15, "DBA": 0.15},
+        "STAGFLASYON": {"USO": 0.4, "GLD": 0.3, "SLV": 0.15, "DBA": 0.15}
+    }
 
-    # CB ve Güven Düzeltmesi
-    if circuit_breaker:
-        w = {"SPY": 0.10, "TLT": 0.40, "DBC": 0.10, "BIL": 0.40}
-    elif confidence == 50:
-        w["SPY"] *= 0.80
-        w["DBC"] *= 0.80
-
-    # --- LEVEL 3: TREND GATE ---
-    trend_data = {}
-    for asset in ["SPY", "TLT", "DBC"]:
-        price = df_w[asset]
-        ema20 = price.ewm(span=20, adjust=False).mean().iloc[-1]
-        ema50 = price.ewm(span=50, adjust=False).mean().iloc[-1]
-        # RSI 14
-        delta = price.diff()
-        gain = (delta.where(delta > 0, 0)).rolling(14).mean().iloc[-1]
-        loss = (-delta.where(delta < 0, 0)).rolling(14).mean().iloc[-1]
-        rsi = 100 - (100 / (1 + (gain/loss))) if loss != 0 else 100
+    # Circuit Breaker Overrides
+    if cb_active:
+        w = {"ENDEKS": 0.10, "TAHVIL": 0.40, "EMTIA": 0.10, "NAKIT": 0.40}
+        sector_universe[final_quad] = ["SPY"] # Sadece defansif endeks
         
-        is_up = (price.iloc[-1] > ema50) and (ema20 > ema50) and (rsi > 50)
-        trend_data[asset] = {"is_up": is_up, "rsi": rsi, "status": "BOĞA" if is_up else "AYI"}
-        if not is_up: w[asset] = min(w[asset], 0.15)
+    # Confidence Haircut
+    if confidence == 50:
+        w["ENDEKS"] *= 0.8; w["EMTIA"] *= 0.8
 
-    # --- LEVEL 4 & 5: VOL TARGETING & NORMALIZATION ---
-    target_vol = 0.12
-    risk_weights = {}
-    for asset in ["SPY", "TLT", "DBC"]:
-        # 20 Haftalık Standart Sapma
-        vol = df_w[asset].pct_change().rolling(20).std().iloc[-1] * np.sqrt(52)
-        vol_cap = target_vol / vol if vol > 0 else 1.0
-        risk_weights[asset] = min(w[asset], vol_cap)
-
-    total_risk_w = sum(risk_weights.values())
-    risk_weights["BIL"] = 1.0 - total_risk_w
+    # --- Trend & Vol Target Hesaplama ---
+    final_portfolio = {}
     
-    return risk_weights, trend_data, current_quad, confidence, circuit_breaker, spread.iloc[-1]
+    # 1. Endeks Sektörleri Dağıtımı
+    active_sectors = sector_universe[final_quad]
+    idx_budget = w["ENDEKS"]
+    sector_w = {}
+    
+    for s in active_sectors:
+        price = df_w[s]
+        ema20 = price.ewm(span=20).mean().iloc[-1]
+        ema50 = price.ewm(span=50).mean().iloc[-1]
+        # RSI
+        delta = price.diff(); gain = (delta.where(delta > 0, 0)).rolling(14).mean(); loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
+        rsi = 100 - (100 / (1 + (gain/loss).iloc[-1])) if loss.iloc[-1] != 0 else 100
+        
+        is_bull = (price.iloc[-1] > ema50) and (ema20 > ema50) and (rsi > 50)
+        
+        # Vol Targeting
+        vol = price.pct_change().rolling(20).std().iloc[-1] * np.sqrt(52)
+        vol_cap = 0.12 / vol if vol > 0 else 1.0
+        
+        # Başlangıç payı (eşit dağılım varsayımı)
+        s_share = (idx_budget / len(active_sectors))
+        if not is_bull: s_share = min(s_share, 0.05) # Trend dışı tavan
+        
+        sector_w[s] = {"w": min(s_share, vol_cap), "rsi": rsi, "trend": "BOĞA" if is_bull else "AYI"}
 
-# --- 3. RAPORLAMA VE UI ---
+    # 2. Emtia Dağıtımı
+    commo_alloc = commo_universe[final_quad]
+    commo_budget = w["EMTIA"]
+    commo_w = {}
+    for c, share in commo_alloc.items():
+        c_price = df_w[c]
+        vol_c = c_price.pct_change().rolling(20).std().iloc[-1] * np.sqrt(52)
+        vol_cap_c = 0.12 / vol_c if vol_c > 0 else 1.0
+        commo_w[c] = min(share * commo_budget, vol_cap_c)
+
+    # 3. Tahvil
+    tlt_vol = df_w['TLT'].pct_change().rolling(20).std().iloc[-1] * np.sqrt(52)
+    tlt_final_w = min(w["TAHVIL"], 0.12 / tlt_vol)
+
+    # 4. Normalizasyon & Nakit
+    total_risky = sum([v['w'] for v in sector_w.values()]) + sum(commo_w.values()) + tlt_final_w
+    final_portfolio = {"SECTORS": sector_w, "COMMOS": commo_w, "TLT": tlt_final_w, "BIL": 1.0 - total_risky}
+    
+    return final_portfolio, current_quad, confidence, cb_active, spread.iloc[-1]
+
+# --- 3. UI DASHBOARD ---
 try:
-    df_d, df_w, df_m = get_engine_data()
-    final_w, trends, quad, conf, cb, spread_val = run_quant_engine(df_d, df_w, df_m)
+    df_d, df_w, df_m = get_dynamic_data()
+    res, quad, conf, cb, spread_val = run_quant_engine(df_d, df_w, df_m)
 
-    st.markdown(f"""
-    ---
-    🛡️ **QUANT MACRO POSITION TRADER RAPORU**
-    📅 Tarih: {datetime.now().strftime('%d %B %Y %H:%M')}
+    st.markdown("### 🛡️ QUANT MACRO POSITION TRADER")
+    st.caption(f"📅 Tarih: {datetime.now().strftime('%d.%m.%Y %H:%M')}")
 
-    📊 **MAKRO & İVME SİNYALLERİ:**
-    • Aktif Kadran: **{quad}** (Güven Skoru: %{conf})
-    • Resesyon Şalteri: **{'AKTİF 🚨' if cb else 'PASİF ✅'}** (Tahvil Yayılımı (10Y-3M): %{spread_val:.2f})
+    # MAKRO SİNYALLER
+    st.markdown("#### 📊 MAKRO & İVME SİNYALLERİ")
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Aktif Kadran", quad, f"Güven: %{conf}")
+    c2.metric("Resesyon Şalteri", "AKTİF 🚨" if cb else "PASİF ✅")
+    c3.metric("Yayılım (10Y-3M)", f"%{spread_val:.2f}")
+
+    st.divider()
+
+    # PORTFÖY TAHSİSİ
+    st.markdown("#### 💼 PORTFÖY TAHSİSİ VE SEKTÖREL DAĞILIM")
     
-    💼 **NİHAİ PORTFÖY TAHSİSİ (NORMALİZE %100):**
-    1. **SPY (Hisse):** %{final_w['SPY']*100:.1f} [EMA Trend: {trends['SPY']['status']} | RSI: {trends['SPY']['rsi']:.1f}]
-    2. **TLT (Tahvil):** %{final_w['TLT']*100:.1f} [EMA Trend: {trends['TLT']['status']} | RSI: {trends['TLT']['rsi']:.1f}]
-    3. **DBC (Emtia):** %{final_w['DBC']*100:.1f} [EMA Trend: {trends['DBC']['status']} | RSI: {trends['DBC']['rsi']:.1f}]
-    4. **BIL (Nakit/Kısa Vadeli):** %{final_w['BIL']*100:.1f} [Tamamlayıcı Bakiye]
+    # Endeks Grubu
+    total_idx = sum([v['w'] for v in res['SECTORS'].values()])
+    with st.expander(f"📌 ENDEKS & SEKTÖRLER (Toplam: %{total_idx*100:.1f})", expanded=True):
+        for s, v in res['SECTORS'].items():
+            st.markdown(f"""
+            <div class="sector-card">
+                <div style="display:flex; justify-content:space-between;">
+                    <b>{s}</b> <span class="metric-val">%{v['w']*100:.1f}</span>
+                </div>
+                <div style="font-size:11px; color:#aaa;">EMA: {v['trend']} | RSI: {v['rsi']:.1f}</div>
+            </div>
+            """, unsafe_allow_html=True)
 
-    🔄 **REBALANS KARARI:**
-    • Durum: **İZLEMEDE**
-    • Açıklama: Portföy sapması <%5 threshold içerisinde. İşlem pas geçildi.
-    ---
-    """)
+    # Emtia Grubu
+    total_c = sum(res['COMMOS'].values())
+    with st.expander(f"📦 EMTİA GRUBU (Toplam: %{total_c*100:.1f})", expanded=True):
+        for c, w_c in res['COMMOS'].items():
+            st.markdown(f"**{c}:** <span class="metric-val">%{w_c*100:.1f}</span>", unsafe_allow_html=True)
+
+    # Tahvil & Nakit
+    st.markdown(f"""
+    <div class="report-card">
+        <b>🏛️ TAHVİL (TLT):</b> <span class="metric-val">%{res['TLT']*100:.1f}</span><br>
+        <b>💵 NAKİT (BIL):</b> <span class="metric-val">%{res['BIL']*100:.1f}</span>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # REBALANS
+    st.markdown("#### 🔄 REBALANS DİSİPLİNİ")
+    st.info("Portföy sapması <%5 threshold içerisinde. İşlem pas geçildi.")
 
 except Exception as e:
     st.error(f"Sistem Hatası: {e}")
