@@ -20,7 +20,7 @@ st.markdown("""
 # SECRETS (FRED API KEY)
 fred_api_key = st.secrets.get("FRED_API_KEY", None)
 
-# --- 1. ÖZELLEŞTİRİLMİŞ TAKVİM MOTORU ---
+# --- 1. VERİ MOTORU (SME UYUMLU) ---
 @st.cache_data(ttl=3600)
 def get_scheduled_data(api_key):
     tickers = {
@@ -29,11 +29,9 @@ def get_scheduled_data(api_key):
         'XLI': 'XLI', 'XLP': 'XLP', 'TIP': 'TIP', 'IEF': 'IEF',
         'TLT': 'TLT', 'GLD': 'GLD', 'SLV': 'SLV', 'USO': 'USO', 'DBB': 'DBB', 'DBA': 'DBA', 'BIL': 'BIL'
     }
-    # Veri setini geniş tutuyoruz (Z-Skor ve trend stabilitesi için)
     df_y = yf.download(list(tickers.values()), period="5y", interval="1d")['Close'].ffill()
     df_y = df_y.rename(columns={v: k for k, v in tickers.items()})
     
-    # FRED Verileri
     df_f = pd.DataFrame(index=df_y.index)
     if api_key:
         fred_ids = {'T10Y3M': 'T10Y3M', 'T10YIE': 'T10YIE', 'WALCL': 'WALCL'}
@@ -49,26 +47,22 @@ def get_scheduled_data(api_key):
                     df_f[name] = obs['value'].reindex(df_y.index, method='ffill')
             except: pass
 
-    # --- ZAMANLAMA FİLTRELERİ (SME UYUMLU) ---
-    
     # HAFTALIK (Salı: 1, Cuma: 4)
     df_w = df_y[df_y.index.dayofweek.isin([1, 4])].ffill()
     
-    # AYLIK (1. ve 15. Günler için en yakın SME - Semi-Month End periyodu)
-    # SME frekansı ayın 15'ini ve ay sonunu baz alır.
+    # AYLIK (1-15 Kontrolü için SME Frekansı)
     df_m = df_y.resample('SME').last().ffill()
     df_f_m = df_f.resample('SME').last().ffill() if not df_f.empty else pd.DataFrame()
     
     return df_y, df_w, df_m, df_f_m
 
+def z_roll(s): return (s - s.rolling(window=126).mean()) / s.rolling(window=126).std()
+
 # --- 2. HESAPLAMA MOTORU ---
 def run_quant_engine(df_y, df_w, df_m, df_f_m):
-    # LEVEL 1: MAKRO KADRAN
     g_ratio = df_m['XLI'] / df_m['XLP']
     i_ratio = df_m['TIP'] / df_m['IEF']
     
-    # Her bir veri noktası ~15 günü temsil ettiği için pencereleri buna göre ayarlıyoruz
-    # 6 nokta = 3 ay teyit | 24 nokta = 12 ay baz
     g_now = g_ratio.rolling(6).mean().iloc[-1] > g_ratio.rolling(24).mean().iloc[-1]
     i_now = i_ratio.rolling(6).mean().iloc[-1] > i_ratio.rolling(24).mean().iloc[-1]
     
@@ -85,7 +79,6 @@ def run_quant_engine(df_y, df_w, df_m, df_f_m):
     g_prev = g_ratio.rolling(6).mean().iloc[-2] > g_ratio.rolling(24).mean().iloc[-2]
     i_prev = i_ratio.rolling(6).mean().iloc[-2] > i_ratio.rolling(24).mean().iloc[-2]
     prev_quad = quad_map.get((g_prev, i_prev), "DARALMA")
-    
     confidence = 100 if current_quad == prev_quad else 50
     final_quad = current_quad if confidence == 100 else prev_quad
 
@@ -95,9 +88,9 @@ def run_quant_engine(df_y, df_w, df_m, df_f_m):
         "STAGFLASYON": {"ENDEKS": 0.10, "TAHVIL": 0.00, "EMTIA": 0.50, "NAKIT": 0.40},
         "DARALMA": {"ENDEKS": 0.10, "TAHVIL": 0.50, "EMTIA": 0.10, "NAKIT": 0.30}
     }
-    w = base_alloc[final_quad].copy()
+    w_base = base_alloc[final_quad].copy()
 
-    # LEVEL 1.1: ROTASYON
+    # SEKTÖR EVRENİ
     sector_universe = {
         "GOLDILOCKS": ["SOXX", "CIBR", "XLY", "QQQ", "BTC"],
         "AŞIRI ISINMA": ["XLF", "XLI", "XLE", "SPY"],
@@ -112,83 +105,73 @@ def run_quant_engine(df_y, df_w, df_m, df_f_m):
     }
 
     if cb_active:
-        w = {"ENDEKS": 0.10, "TAHVIL": 0.40, "EMTIA": 0.10, "NAKIT": 0.40}
-        sector_universe[final_quad] = ["SPY"]
+        w_base = {"ENDEKS": 0.10, "TAHVIL": 0.40, "EMTIA": 0.10, "NAKIT": 0.40}
+        active_sectors = ["SPY"]
+    else:
+        active_sectors = sector_universe.get(final_quad, ["SPY"])
         
     if confidence == 50:
-        w["ENDEKS"] *= 0.8; w["EMTIA"] *= 0.8
+        w_base["ENDEKS"] *= 0.8; w_base["EMTIA"] *= 0.8
 
-    # --- HESAPLAMALAR ---
-    final_res = {"SECTORS": {}, "COMMOS": {}, "TLT": 0.0, "BIL": 0.0}
+    # HESAPLAMA
+    res_final = {"SECTORS": {}, "COMMOS": {}, "TLT": 0.0, "BIL": 0.0}
     
-    # 1. Sektörler (Salı-Cuma İvmesi)
-    idx_budget = w["ENDEKS"]
-    active_sectors = sector_universe.get(final_quad, ["SPY"])
+    # Endeks & Sektörler
+    budget_idx = w_base["ENDEKS"]
     for s in active_sectors:
         price = df_w[s]
-        ema20 = price.ewm(span=40).mean().iloc[-1]
         ema50 = price.ewm(span=100).mean().iloc[-1]
-        delta = price.diff()
-        gain = delta.where(delta>0,0).rolling(28).mean()
-        loss = (-delta.where(delta<0,0)).rolling(28).mean()
-        rsi = 100 - (100/(1+(gain.iloc[-1]/loss.iloc[-1]))) if loss.iloc[-1] != 0 else 100
-        is_bull = (price.iloc[-1] > ema50) and (ema20 > ema50) and (rsi > 50)
-        
         vol = price.pct_change().rolling(40).std().iloc[-1] * np.sqrt(104)
-        v_cap = 0.12 / vol if (vol > 0 and not np.isnan(vol)) else 1.0
-        s_w = (idx_budget / len(active_sectors))
-        if not is_bull: s_w = min(s_w, 0.05)
+        v_cap = 0.12 / vol if (vol > 0) else 1.0
+        s_w = (budget_idx / len(active_sectors))
+        if price.iloc[-1] < ema50: s_w = min(s_w, 0.05)
         if s == "BTC" and (final_quad in ["STAGFLASYON", "DARALMA"] or cb_active): s_w = 0.0
-        
-        final_res["SECTORS"][s] = {"w": min(s_w, v_cap), "rsi": rsi, "trend": "BOĞA" if is_bull else "AYI"}
+        res_final["SECTORS"][s] = {"w": min(s_w, v_cap), "trend": "BOĞA" if price.iloc[-1] > ema50 else "AYI"}
 
-    # 2. Emtia & Tahvil
-    c_budget = w["EMTIA"]
+    # Emtia
+    budget_c = w_base["EMTIA"]
     for c, sh in commo_universe.get(final_quad, {}).items():
         v_c = df_w[c].pct_change().rolling(40).std().iloc[-1] * np.sqrt(104)
-        final_res["COMMOS"][c] = min(sh * c_budget, 0.12 / v_c if (v_c > 0 and not np.isnan(v_c)) else 1.0)
+        res_final["COMMOS"][c] = min(sh * budget_c, 0.12 / v_c if v_c > 0 else 1.0)
 
+    # Tahvil
     t_v = df_w['TLT'].pct_change().rolling(40).std().iloc[-1] * np.sqrt(104)
-    final_res["TLT"] = min(w["TAHVIL"], 0.12 / t_v if (t_v > 0 and not np.isnan(t_v)) else 1.0)
+    res_final["TLT"] = min(w_base["TAHVIL"], 0.12 / t_v if t_v > 0 else 1.0)
     
-    total_risky = sum([v['w'] for v in final_res["SECTORS"].values()]) + sum(final_res["COMMOS"].values()) + final_res["TLT"]
-    final_res["BIL"] = max(0.0, 1.0 - total_risky)
+    risky_total = sum([v['w'] for v in res_final["SECTORS"].values()]) + sum(res_final["COMMOS"].values()) + res_final["TLT"]
+    res_final["BIL"] = max(0.0, 1.0 - risky_total)
     
-    return final_res, current_quad, confidence, cb_active, spread.iloc[-1], df_w.index[-1], df_m.index[-1]
+    return res_final, current_quad, confidence, cb_active, spread.iloc[-1], df_w.index[-1], df_m.index[-1]
 
 # --- 3. UI DASHBOARD ---
 try:
     df_y, df_w, df_m, df_f_m = get_scheduled_data(fred_api_key)
-    res, quad, conf, cb, spread_v, last_w_date, last_m_date = run_quant_engine(df_y, df_w, df_m, df_f_m)
+    res, quad, conf, cb, spread_v, w_date, m_date = run_quant_engine(df_y, df_w, df_m, df_f_m)
 
     st.markdown("### 🛡️ QUANT MACRO POSITION TRADER V2.3")
-    
-    st.markdown(f"""
-        <div class="report-card">
-            <span class="check-date">📅 <b>Haftalık İvme (Salı-Cuma):</b> {last_w_date.strftime('%d.%m.%Y')}</span> | 
-            <span class="check-date">🗓️ <b>Aylık Makro (1-15):</b> {last_m_date.strftime('%d.%m.%Y')}</span>
-        </div>
-    """, unsafe_allow_html=True)
+    st.markdown(f"""<div class="report-card"><span class="check-date">📅 <b>Haftalık:</b> {w_date.strftime('%d.%m.%Y')}</span> | <span class="check-date">🗓️ <b>Aylık:</b> {m_date.strftime('%d.%m.%Y')}</span></div>""", unsafe_allow_html=True)
 
     c1, c2, c3 = st.columns(3)
-    c1.metric("Aktif Kadran", quad, f"Güven: %{conf}")
+    c1.metric("Aktif Kadran", quad, f"%{conf}")
     c2.metric("Resesyon Şalteri", "AKTİF 🚨" if cb else "PASİF ✅")
-    c3.metric("Tahvil Yayılımı (FRED)", f"%{spread_v:.2f}")
+    c3.metric("Yayılım (FRED)", f"%{spread_v:.2f}")
 
     st.divider()
 
-    # Sektör Kartları
     t_idx = sum([v['w'] for v in res['SECTORS'].values()])
     with st.expander(f"📌 ENDEKS & SEKTÖRLER (%{t_idx*100:.1f})", expanded=True):
         for s, v in res['SECTORS'].items():
-            st.markdown(f'''
-            <div class="sector-card">
-                <div style="display:flex; justify-content:space-between;">
-                    <b>{s}</b> <span class="metric-val">%{v['w']*100:.1f}</span>
-                </div>
-                <div style="font-size:11px; color:#aaa;">Trend: {v['trend']} | RSI: {v['rsi']:.1f}</div>
-            </div>
-            ''', unsafe_allow_html=True)
+            w_perc = v['w'] * 100
+            st.markdown(f"""<div class="sector-card"><div style="display:flex; justify-content:space-between;"><b>{s}</b> <span class="metric-val">%{w_perc:.1f}</span></div><div style="font-size:11px; color:#aaa;">Trend: {v['trend']}</div></div>""", unsafe_allow_html=True)
 
-    # Emtia Kartları
     t_c = sum(res['COMMOS'].values())
+    with st.expander(f"📦 EMTİA GRUBU (%{t_c*100:.1f})", expanded=True):
+        for c, weight in res['COMMOS'].items():
+            w_c_perc = weight * 100
+            st.markdown(f"**{c}:** <span class='metric-val'>%{w_c_perc:.1f}</span>", unsafe_allow_html=True)
+
+    tlt_p, bil_p = res['TLT']*100, res['BIL']*100
+    st.markdown(f"""<div class="report-card"><b>🏛️ TAHVİL (TLT):</b> <span class="metric-val">%{tlt_p:.1f}</span><br><b>💵 NAKİT (BIL):</b> <span class="metric-val">%{bil_p:.1f}</span></div>""", unsafe_allow_html=True)
+
+except Exception as e:
+    st.error(f"Sistem Hatası: {e}")
